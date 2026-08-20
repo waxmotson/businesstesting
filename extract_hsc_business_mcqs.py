@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+Extract screenshots of each multiple-choice question (Questions 1–20)
+from NSW HSC Business Studies past papers.
+
+Expected PDF layout (relative to where you run the script):
+
+    ./HSC_PAPERS/BusinessStudies/
+        2016/2016-hsc-business-studies.pdf
+        2017/2017-hsc-business-studies.pdf
+        ...
+        2025/2025-hsc-business-studies.pdf
+
+Usage:
+    python extract_hsc_business_mcqs.py              # all years found
+    python extract_hsc_business_mcqs.py --year 2024  # single year
+    python extract_hsc_business_mcqs.py --out-dir screenshots
+
+Requirements:
+    pip install pymupdf Pillow numpy
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    import fitz  # pymupdf
+except ImportError:
+    print("Missing dependency: pymupdf")
+    print("Install with:  pip install pymupdf")
+    sys.exit(1)
+
+try:
+    from PIL import Image
+    import numpy as np
+except ImportError:
+    print("Missing dependency: Pillow / numpy")
+    print("Install with:  pip install Pillow numpy")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+SCALE = 2.0                 # ~144 dpi → 1190 px wide for A4
+TOP_PAD_PTS = 12
+BETWEEN_PAD_PTS = 6
+FOOTER_Y = 775              # avoid page-number footers
+FINAL_PAD_PX = 22           # padding after whitespace trim
+
+DEFAULT_PDF_ROOT = Path("HSC_PAPERS") / "BusinessStudies"
+DEFAULT_OUT_DIR = Path("mcq_screenshots")
+YEARS = list(range(2016, 2026))
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+def find_mcq_positions(doc: fitz.Document) -> list[dict]:
+    """Locate the top of each MCQ (1-20) by finding left-aligned question numbers."""
+    questions = []
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        blocks = page.get_text("dict")["blocks"]
+        for b in blocks:
+            if b.get("type") != 0:
+                continue
+            for line in b["lines"]:
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    if not text.isdigit():
+                        continue
+                    n = int(text)
+                    if 1 <= n <= 20 and span["bbox"][0] < 90 and 9 < span["size"] < 14:
+                        questions.append({
+                            "num": n,
+                            "page": page_idx,
+                            "y": span["bbox"][1],
+                        })
+    questions = sorted(questions, key=lambda q: (q["page"], q["y"]))
+    seen = set()
+    unique = []
+    for q in questions:
+        if q["num"] not in seen:
+            seen.add(q["num"])
+            unique.append(q)
+    return unique
+
+
+def get_content_bottom(page: fitz.Page, start_y: float, footer_y: float) -> float:
+    """Lowest y of content (text or drawings) after start_y, before footer."""
+    max_y = start_y
+    blocks = page.get_text("dict")["blocks"]
+    for b in blocks:
+        if b.get("type") != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                y1 = span["bbox"][3]
+                if start_y - 2 < span["bbox"][1] < footer_y and y1 < footer_y:
+                    max_y = max(max_y, y1)
+    for d in page.get_drawings():
+        r = d["rect"]
+        if r.y0 > start_y - 5 and r.y1 < footer_y:
+            max_y = max(max_y, r.y1)
+    return max_y
+
+
+def trim_vertical_whitespace(img: Image.Image, pad: int = FINAL_PAD_PX, bg_thresh: int = 250) -> Image.Image:
+    """Remove excess white space top/bottom, keep left/right margins, add pad."""
+    arr = np.array(img)
+    mask = np.any(arr < bg_thresh, axis=2)
+    rows_with_content = np.any(mask, axis=1)
+    if not np.any(rows_with_content):
+        return img
+    rmin, rmax = np.where(rows_with_content)[0][[0, -1]]
+    rmin = max(0, rmin - pad)
+    rmax = min(arr.shape[0] - 1, rmax + pad)
+    return img.crop((0, rmin, arr.shape[1], rmax + 1))
+
+
+def extract_year(pdf_path: Path, out_dir: Path, year: int) -> int:
+    """Extract all MCQ screenshots for one paper. Returns number of questions saved."""
+    doc = fitz.open(pdf_path)
+    qs = find_mcq_positions(doc)
+
+    if len(qs) != 20:
+        print(f"  WARNING: expected 20 questions, found {len(qs)}")
+        found = {q["num"] for q in qs}
+        missing = sorted(set(range(1, 21)) - found)
+        if missing:
+            print(f"  Missing: {missing}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+
+    for i, q in enumerate(qs):
+        page = doc[q["page"]]
+
+        top = max(0.0, q["y"] - TOP_PAD_PTS)
+
+        if i + 1 < len(qs) and qs[i + 1]["page"] == q["page"]:
+            bottom = qs[i + 1]["y"] - BETWEEN_PAD_PTS
+        else:
+            content_bottom = get_content_bottom(page, q["y"], FOOTER_Y)
+            bottom = min(FOOTER_Y, content_bottom + 12)
+
+        if bottom <= top + 30:
+            bottom = top + 80
+
+        mat = fitz.Matrix(SCALE, SCALE)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        top_px = max(0, int(round(top * SCALE)))
+        bot_px = min(pix.height, int(round(bottom * SCALE)))
+        crop = img.crop((0, top_px, pix.width, bot_px))
+        crop = trim_vertical_whitespace(crop, pad=FINAL_PAD_PX)
+
+        out_name = f"HSC_BUSINESS_{year}_Q{q['num']:02d}.png"
+        out_path = out_dir / out_name
+        crop.save(out_path, "PNG", optimize=True)
+        print(f"  Q{q['num']:02d} → {out_name}  ({crop.size[0]}×{crop.size[1]})")
+        count += 1
+
+    doc.close()
+    return count
+
+
+def find_pdf(year: int, pdf_root: Path) -> Path | None:
+    """Return the PDF path for a year, or None if missing."""
+    candidate = pdf_root / str(year) / f"{year}-hsc-business-studies.pdf"
+    if candidate.is_file():
+        return candidate
+    # also try a couple of common alternative names just in case
+    for alt in (
+        pdf_root / str(year) / f"{year}-hsc-business-studies.pdf",
+        pdf_root / f"{year}-hsc-business-studies.pdf",
+        pdf_root / str(year) / f"{year}_hsc_business_studies.pdf",
+    ):
+        if alt.is_file():
+            return alt
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Extract HSC Business Studies multiple-choice question screenshots"
+    )
+    parser.add_argument(
+        "--year", type=int,
+        help="Process only this year (e.g. 2024). Default: all years found."
+    )
+    parser.add_argument(
+        "--pdf-root", type=str, default=str(DEFAULT_PDF_ROOT),
+        help=f"Root folder containing year subfolders (default: {DEFAULT_PDF_ROOT})"
+    )
+    parser.add_argument(
+        "--out-dir", type=str, default=str(DEFAULT_OUT_DIR),
+        help=f"Where to save the PNG screenshots (default: {DEFAULT_OUT_DIR})"
+    )
+    args = parser.parse_args()
+
+    pdf_root = Path(args.pdf_root)
+    out_dir = Path(args.out_dir)
+
+    if not pdf_root.is_dir():
+        print(f"ERROR: PDF root folder not found: {pdf_root.resolve()}")
+        print()
+        print("Expected structure:")
+        print("  HSC_PAPERS/BusinessStudies/")
+        print("    2016/2016-hsc-business-studies.pdf")
+        print("    2017/2017-hsc-business-studies.pdf")
+        print("    ...")
+        print("    2025/2025-hsc-business-studies.pdf")
+        print()
+        print("Run this script from the folder that contains the HSC_PAPERS directory.")
+        sys.exit(1)
+
+    years = [args.year] if args.year else YEARS
+    total = 0
+    processed = 0
+
+    for year in years:
+        pdf_path = find_pdf(year, pdf_root)
+        if pdf_path is None:
+            print(f"Skipping {year}: PDF not found under {pdf_root / str(year)}")
+            continue
+
+        print(f"\n=== {year} HSC Business Studies ===")
+        print(f"  Source: {pdf_path}")
+        n = extract_year(pdf_path, out_dir, year)
+        total += n
+        processed += 1
+
+    print()
+    if processed == 0:
+        print("No papers were processed. Check that the PDFs exist in the expected locations.")
+        sys.exit(1)
+    else:
+        print(f"Done. Extracted {total} question screenshots into: {out_dir.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
